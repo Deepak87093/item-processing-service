@@ -1,13 +1,17 @@
 import threading
 
-from app.models import Item, ItemStatus
+from sqlalchemy import select
+
+from app.models import Item, ItemStatus, ProcessingRecord
 from app.services.item_processor import process_item
 
 
 def test_concurrent_processing(
-    test_engine,
     session_factory,
 ):
+    # ---------------------------------------------------------
+    # 1. Create the item that both threads will try to process
+    # ---------------------------------------------------------
     setup_session = session_factory()
 
     item = Item(
@@ -24,6 +28,9 @@ def test_concurrent_processing(
 
     setup_session.close()
 
+    # ---------------------------------------------------------
+    # 2. Run two concurrent processing requests
+    # ---------------------------------------------------------
     results = []
     errors = []
 
@@ -33,8 +40,10 @@ def test_concurrent_processing(
         try:
             result = process_item(session, item_id)
             results.append(result.status)
+
         except Exception as exc:
             errors.append(exc)
+
         finally:
             session.close()
 
@@ -47,5 +56,38 @@ def test_concurrent_processing(
     thread_1.join()
     thread_2.join()
 
+    # ---------------------------------------------------------
+    # 3. Both requests should complete successfully
+    # ---------------------------------------------------------
     assert not errors
     assert len(results) == 2
+
+    # ---------------------------------------------------------
+    # 4. Verify the database state
+    # ---------------------------------------------------------
+    verification_session = session_factory()
+
+    try:
+        records = verification_session.execute(
+            select(ProcessingRecord).where(
+                ProcessingRecord.item_id == item_id
+            )
+        ).scalars().all()
+
+        final_item = verification_session.get(
+            Item,
+            item_id,
+        )
+
+        # Only ONE actual processing operation should happen.
+        assert len(records) == 1
+
+        # That processing operation must succeed.
+        assert records[0].status == "SUCCESS"
+
+        # The item must finally be COMPLETED.
+        assert final_item is not None
+        assert final_item.status == ItemStatus.COMPLETED
+
+    finally:
+        verification_session.close()

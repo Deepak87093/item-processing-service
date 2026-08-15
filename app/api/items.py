@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schema.item import ItemCreate, ItemResponse, ItemProcessResponse
 from app.services.item_processor import create_item, get_item, process_item
+from app.services.idempotency import IdempotencyConflictError
+from fastapi import Header
 
 
 router = APIRouter(
@@ -49,14 +51,32 @@ def get_item_endpoint(
 )
 def process_item_endpoint(
     item_id: int,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
     db: Session = Depends(get_db),
 ):
     try:
-        item = process_item(db, item_id)
+        item = process_item(
+            db,
+            item_id,
+            idempotency_key,
+        )
+
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Item not found",
+        )
+
+    except IdempotencyConflictError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Idempotency key was already used "
+                "for a different request"
+            ),
         )
 
     return ItemProcessResponse(
