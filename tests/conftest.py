@@ -4,7 +4,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import TEST_DATABASE_URL
 from app.database import Base
-from app.models import Item, ProcessingRecord
+from app.models import (
+    IdempotencyRecord,
+    Item,
+    ProcessingRecord,
+)
 
 
 @pytest.fixture(scope="session")
@@ -34,14 +38,13 @@ def session_factory(test_engine):
 
 def clean_database(session: Session) -> None:
     """
-    Clean test data in the correct foreign-key order.
-
-    processing_records references items, so the child table
-    must be deleted before the parent table.
+    Delete child records before parent records.
     """
 
+    session.execute(delete(IdempotencyRecord))
     session.execute(delete(ProcessingRecord))
     session.execute(delete(Item))
+
     session.commit()
 
 
@@ -71,10 +74,6 @@ def clean_test_database(test_engine):
 
 @pytest.fixture
 def db_session(test_engine):
-    """
-    Database session for normal tests.
-    """
-
     session = Session(test_engine)
 
     try:

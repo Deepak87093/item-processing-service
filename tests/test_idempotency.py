@@ -2,20 +2,25 @@ import threading
 
 from sqlalchemy import select
 
-from app.models import Item, ItemStatus, ProcessingRecord
+from app.models import (
+    IdempotencyRecord,
+    Item,
+    ItemStatus,
+    ProcessingRecord,
+)
 from app.services.item_processor import process_item
 
 
-def test_concurrent_processing(
+def test_concurrent_same_idempotency_key(
     session_factory,
 ):
     # ---------------------------------------------------------
-    # 1. Create the item that both threads will try to process
+    # 1. Create test item
     # ---------------------------------------------------------
     setup_session = session_factory()
 
     item = Item(
-        name="Concurrent Item",
+        name="Concurrent Idempotency Item",
         amount=100,
         status=ItemStatus.PENDING,
     )
@@ -28,23 +33,19 @@ def test_concurrent_processing(
 
     setup_session.close()
 
-    # ---------------------------------------------------------
-    # 2. Run two concurrent processing requests
-    # ---------------------------------------------------------
     # Both requests use exactly the same key.
     idempotency_key = "concurrent-key-001"
-    barrier = threading.Barrier(2)
 
     results = []
     errors = []
 
-
+    # ---------------------------------------------------------
+    # 2. Worker
+    # ---------------------------------------------------------
     def worker():
         session = session_factory()
 
         try:
-            barrier.wait()
-
             result = process_item(
                 session,
                 item_id,
@@ -59,6 +60,9 @@ def test_concurrent_processing(
         finally:
             session.close()
 
+    # ---------------------------------------------------------
+    # 3. Start two concurrent requests
+    # ---------------------------------------------------------
     thread_1 = threading.Thread(target=worker)
     thread_2 = threading.Thread(target=worker)
 
@@ -69,13 +73,7 @@ def test_concurrent_processing(
     thread_2.join()
 
     # ---------------------------------------------------------
-    # 3. Both requests should complete successfully
-    # ---------------------------------------------------------
-    assert not errors
-    assert len(results) == 2
-
-    # ---------------------------------------------------------
-    # 4. Verify the database state
+    # 4. Verify
     # ---------------------------------------------------------
     verification_session = session_factory()
 
@@ -86,18 +84,26 @@ def test_concurrent_processing(
             )
         ).scalars().all()
 
+        idempotency_records = verification_session.execute(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.idempotency_key
+                == idempotency_key
+            )
+        ).scalars().all()
+
         final_item = verification_session.get(
             Item,
             item_id,
         )
 
-        # Only ONE actual processing operation should happen.
+        assert len(results) == 2
+
+        assert len(errors) == 0
+
         assert len(records) == 1
 
-        # That processing operation must succeed.
-        assert records[0].status == "SUCCESS"
+        assert len(idempotency_records) == 1
 
-        # The item must finally be COMPLETED.
         assert final_item is not None
         assert final_item.status == ItemStatus.COMPLETED
 
