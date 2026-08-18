@@ -1,20 +1,32 @@
-from sqlalchemy.orm import Session
 import json
-from app.models.item import Item, ItemStatus
-from app.models import ProcessingRecord
-from app.schema.item import ItemCreate
-from app.models.idempotency import IdempotencyRecord
+import time
+from dataclasses import dataclass
+
+from sqlalchemy.orm import Session
+
+from app.models import (
+    IdempotencyRecord,
+    Item,
+    ItemStatus,
+    ProcessingRecord,
+)
 from app.services.idempotency import (
     IdempotencyConflictError,
-    generate_request_hash
+    deserialize_response,
+    generate_request_hash,
 )
-import time
 
+
+@dataclass
+class ProcessResult:
+    item: Item
+    response: dict
+    replayed: bool = False
 
 
 def create_item(
     db: Session,
-    item_data: ItemCreate,
+    item_data,
 ) -> Item:
     item = Item(
         name=item_data.name,
@@ -39,16 +51,31 @@ def get_item(
         .first()
     )
 
+
+def get_item_for_update(
+    db: Session,
+    item_id: int,
+) -> Item | None:
+    return (
+        db.query(Item)
+        .filter(Item.id == item_id)
+        .with_for_update()
+        .first()
+    )
+
+
 def process_item(
     db: Session,
     item_id: int,
     idempotency_key: str | None = None,
-) -> Item:
+) -> ProcessResult:
+
+    # =========================================================
+    # 1. Check idempotency record
+    # =========================================================
+
     request_hash = None
 
-    # ---------------------------------------------------------
-    # 1. Check idempotency key
-    # ---------------------------------------------------------
     if idempotency_key:
         request_hash = generate_request_hash(item_id)
 
@@ -62,34 +89,78 @@ def process_item(
         )
 
         if existing_record:
+
+            # Same key but different request
             if existing_record.request_hash != request_hash:
                 raise IdempotencyConflictError(
                     "Idempotency key was already used "
                     "for a different request"
                 )
 
-            return get_item(db, existing_record.item_id)
+            # Same key + same request = retry
+            if existing_record.response:
+                response = deserialize_response(
+                    existing_record.response
+                )
 
-    # ---------------------------------------------------------
+                item = get_item(
+                    db,
+                    existing_record.item_id,
+                )
+
+                if item is None:
+                    raise ValueError("Item not found")
+
+                return ProcessResult(
+                    item=item,
+                    response=response,
+                    replayed=True,
+                )
+
+    # =========================================================
     # 2. Lock the item
-    # ---------------------------------------------------------
-    item = get_item_for_update(db, item_id)
+    # =========================================================
+
+    item = get_item_for_update(
+        db,
+        item_id,
+    )
 
     if item is None:
         raise ValueError("Item not found")
 
-    # ---------------------------------------------------------
-    # 3. Check whether already completed
-    # ---------------------------------------------------------
+    # =========================================================
+    # 3. Check if already completed
+    # =========================================================
+
     if item.status == ItemStatus.COMPLETED:
-        return item
+
+        response = {
+            "item_id": item.id,
+            "status": item.status.value,
+            "message": "Item processed successfully",
+        }
+
+        return ProcessResult(
+            item=item,
+            response=response,
+            replayed=False,
+        )
+
+    # =========================================================
+    # 4. Mark item as processing
+    # =========================================================
 
     item.status = ItemStatus.PROCESSING
 
-    # ---------------------------------------------------------
-    # 4. Store idempotency record
-    # ---------------------------------------------------------
+    # =========================================================
+    # 5. Create idempotency record
+    # =========================================================
+
+    idempotency_record = None
+
     if idempotency_key:
+
         idempotency_record = IdempotencyRecord(
             idempotency_key=idempotency_key,
             item_id=item.id,
@@ -99,9 +170,10 @@ def process_item(
 
         db.add(idempotency_record)
 
-    # ---------------------------------------------------------
-    # 5. Record business processing
-    # ---------------------------------------------------------
+    # =========================================================
+    # 6. Create business processing record
+    # =========================================================
+
     processing_record = ProcessingRecord(
         item_id=item.id,
         status="STARTED",
@@ -109,40 +181,51 @@ def process_item(
 
     db.add(processing_record)
 
-    # ---------------------------------------------------------
-    # 6. Simulate business operation
-    # ---------------------------------------------------------
+    # =========================================================
+    # 7. Simulate business processing
+    # =========================================================
+
     time.sleep(2)
 
-    # ---------------------------------------------------------
-    # 7. Complete processing
-    # ---------------------------------------------------------
+    # =========================================================
+    # 8. Complete processing
+    # =========================================================
+
     processing_record.status = "SUCCESS"
 
     item.status = ItemStatus.COMPLETED
 
-    if idempotency_key:
+    # =========================================================
+    # 9. Build API response
+    # =========================================================
+
+    response = {
+        "item_id": item.id,
+        "status": item.status.value,
+        "message": "Item processed successfully",
+    }
+
+    # =========================================================
+    # 10. Store exact response for idempotent replay
+    # =========================================================
+
+    if idempotency_record:
+
         idempotency_record.status = "COMPLETED"
+
         idempotency_record.response = json.dumps(
-            {
-                "item_id": item.id,
-                "status": item.status.value,
-                "message": "Item processed successfully",
-            }
+            response
         )
+
+    # =========================================================
+    # 11. Commit everything atomically
+    # =========================================================
 
     db.commit()
     db.refresh(item)
 
-    return item
-
-def get_item_for_update(
-    db: Session,
-    item_id: int,
-) -> Item | None:
-    return (
-        db.query(Item)
-        .filter(Item.id == item_id)
-        .with_for_update()
-        .first()
+    return ProcessResult(
+        item=item,
+        response=response,
+        replayed=False,
     )

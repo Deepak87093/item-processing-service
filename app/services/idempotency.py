@@ -24,3 +24,7 @@ def generate_request_hash(
     ).hexdigest()
 
 
+def deserialize_response(
+    response: str,
+) -> dict:
+    return json.loads(response)

@@ -58,11 +58,11 @@ def process_item_endpoint(
     db: Session = Depends(get_db),
 ):
     try:
-        item = process_item(
-            db,
-            item_id,
-            idempotency_key,
-        )
+        result = process_item(
+                db,
+                item_id,
+                idempotency_key,
+            )
 
     except ValueError:
         raise HTTPException(
@@ -80,7 +80,5 @@ def process_item_endpoint(
         )
 
     return ItemProcessResponse(
-        item_id=item.id,
-        status=item.status,
-        message="Item processed successfully",
+        **result.response,
     )

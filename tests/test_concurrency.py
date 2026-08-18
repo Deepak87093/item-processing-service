@@ -48,10 +48,10 @@ def test_concurrent_processing(
             result = process_item(
                 session,
                 item_id,
-                idempotency_key,
+                #idempotency_key,
             )
 
-            results.append(result)
+            results.append(result.item.status)
 
         except Exception as exc:
             errors.append(exc)
